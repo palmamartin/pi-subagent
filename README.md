@@ -2,13 +2,16 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in Rex with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or open the child TUI.
+
+- **Parent inside Rex**: each child opens as a background tab, labelled `subagent <name>`, in the parent's Rex session. The tab closes when the child exits.
+- **Parent outside Rex**: each child gets a dedicated `pi-subagent-<handle>` Rex session. You can open it with `rex attach`. The session closes when the child exits.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- tmux
+- Rex, with the `rex` CLI on `PATH`
 
 ## Install
 
@@ -68,7 +71,7 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select and open an active child. Inside Rex, it focuses the child's tab. Outside Rex, it suspends the parent TUI and runs `rex attach` on the child's session. The status widget shows active names (or handles for unnamed runs) and their current state.
 
 ## Isolation
 
@@ -79,5 +82,7 @@ Optional spawn flags:
 - `--no-skills`: disable skills
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files
+
+Rex starts commands with its server's environment, so the child doesn't inherit the spawning process's environment automatically. That environment (`PATH`, credentials, `PI_CODING_AGENT_DIR`, ...) is forwarded through a launch script in the run directory. The script deletes itself on start, which keeps secrets out of `argv` and off disk.
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.

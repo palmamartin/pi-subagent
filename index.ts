@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,14 +7,15 @@ import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendi
 import {
 	effectiveRunState,
 	inboxDir,
+	closeRexRun,
+	isRunAlive,
 	launchRun,
 	listRuns,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
 	type InboxMessage,
-	type RunMetadata,
-	tmuxSessionExists,
+	liveRexBlocks,
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
@@ -27,8 +28,12 @@ function isInboxMessage(value: unknown): value is InboxMessage {
 	return typeof message.message === "string" && (message.delivery === "auto" || message.delivery === "followUp");
 }
 
-function displayState(metadata: RunMetadata): string {
-	return effectiveRunState(metadata).padEnd(8);
+function runRex(args: string[], stdio: "inherit" | "ignore"): Promise<number | null> {
+	return new Promise((resolveExit) => {
+		const child = spawn("rex", args, { stdio });
+		child.on("error", () => resolveExit(null));
+		child.on("close", resolveExit);
+	});
 }
 
 export default function subagentExtension(pi: ExtensionAPI) {
@@ -38,17 +43,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("subagent", {
-		description: "Select and attach to a subagent spawned by this session",
+		description: "Select and open a subagent spawned by this session",
 		handler: async (_args, ctx) => {
-			const runs = listRuns(ctx.sessionManager.getSessionId()).filter((run) => effectiveRunState(run) !== "exited");
+			const liveBlocks = liveRexBlocks();
+			const runs = listRuns(ctx.sessionManager.getSessionId())
+				.map((run) => ({ run, state: effectiveRunState(run, liveBlocks) }))
+				.filter(({ state }) => state !== "exited");
 			if (runs.length === 0) {
 				ctx.ui.notify("No active subagents spawned by this session", "info");
 				return;
 			}
 
-			const items: SelectItem[] = runs.map((run) => ({
+			const items: SelectItem[] = runs.map(({ run, state }) => ({
 				value: run.handle,
-				label: `${runDisplayName(run)}  ${displayState(run)}  ${run.provider}/${run.model}  ${run.thinking}`,
+				label: `${runDisplayName(run)}  ${state.padEnd(8)}  ${run.provider}/${run.model}  ${run.thinking}`,
 			}));
 			let tui: TUI | undefined;
 			const selected = await ctx.ui.custom<string | undefined>((customTui, theme, _keybindings, done) => {
@@ -65,13 +73,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 				const container = new Container();
 				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-				container.addChild(new Text(theme.fg("accent", theme.bold("Attach to subagent")), 1, 0));
+				container.addChild(new Text(theme.fg("accent", theme.bold("Open subagent")), 1, 0));
 				container.addChild(list);
 				container.addChild(
 					new Text(
 						theme.fg(
 							"dim",
-							`${keyHint("tui.select.confirm", "attach")}  ${keyHint("tui.select.cancel", "cancel")}`,
+							`${keyHint("tui.select.confirm", "open")}  ${keyHint("tui.select.cancel", "cancel")}`,
 						),
 						1,
 						0,
@@ -89,26 +97,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				};
 			});
 			if (!selected || !tui) return;
-			const run = runs.find((candidate) => candidate.handle === selected);
-			if (!run) return;
+			const run = runs.find(({ run: candidate }) => candidate.handle === selected)?.run;
+			const placement = run?.rex;
+			if (!run || !placement) return;
 
-			if (process.env.TMUX) {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["switch-client", "-t", run.tmuxSession], { stdio: "inherit" });
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
-				if (exitCode !== 0) ctx.ui.notify(`Could not switch to ${run.handle}`, "error");
+			// Make the child's block the focused one in its session. When that is the session this Pi runs
+			// in, focusing switches the Rex tab and we are done; otherwise attach to the child's session.
+			const focused = await runRex(
+				["--autostart=false", "focus", "--session", placement.sessionId, placement.blockId],
+				"ignore",
+			);
+			if (process.env.REX_SESSION === placement.sessionId) {
+				if (focused !== 0) ctx.ui.notify(`Could not focus ${runDisplayName(run)}`, "error");
 				return;
 			}
 
 			tui.stop();
 			try {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["attach-session", "-t", run.tmuxSession], { stdio: "inherit" });
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
+				const exitCode = await runRex(["attach", placement.sessionId], "inherit");
 				if (exitCode !== 0) process.stderr.write(`Could not attach to ${run.handle}\n`);
 			} finally {
 				tui.start();
@@ -123,8 +129,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 		const refreshWidget = (): void => {
 			if (!widgetContext) return;
+			const liveBlocks = liveRexBlocks();
 			const activeRuns = listRuns(widgetContext.sessionManager.getSessionId())
-				.map((run) => ({ run, state: effectiveRunState(run) }))
+				.map((run) => ({ run, state: effectiveRunState(run, liveBlocks) }))
 				.filter(({ state }) => state !== "exited");
 			if (activeRuns.length === 0) {
 				widgetContext.ui.setWidget("subagents", undefined);
@@ -148,8 +155,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
+			const liveBlocks = liveRexBlocks();
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
+				if (!run.suspended || isRunAlive(run, liveBlocks)) continue;
 				if (!existsSync(run.sessionFile)) {
 					removeRunDir(run.runDir);
 					continue;
@@ -179,13 +187,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (event.reason === "reload") return;
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
+			const liveBlocks = liveRexBlocks();
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!tmuxSessionExists(run.tmuxSession)) {
+				if (!isRunAlive(run, liveBlocks)) {
 					if (!run.suspended) removeRunDir(run.runDir);
 					continue;
 				}
 				updateMetadata(run.runDir, { suspended: true });
-				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+				closeRexRun(run);
 				await waitForRunShutdown(run.runDir);
 			}
 		});
